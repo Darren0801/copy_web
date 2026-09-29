@@ -682,6 +682,127 @@
       to { transform: translateX(0); opacity: 1; }
     }
 
+    /* 密码锁屏 */
+    .lock-screen {
+      position: fixed;
+      inset: 0;
+      background: var(--bg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 2000;
+      padding: 24px;
+    }
+
+    .lock-screen.hidden {
+      display: none;
+    }
+
+    .lock-card {
+      width: 100%;
+      max-width: 320px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.06);
+      padding: 28px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    :root.dark .lock-card {
+      box-shadow: none;
+      border-color: #404040;
+    }
+
+    .lock-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text);
+      text-align: center;
+    }
+
+    .lock-subtitle {
+      font-size: 12px;
+      color: var(--text-secondary);
+      text-align: center;
+      margin-top: -10px;
+    }
+
+    .lock-input {
+      width: 100%;
+      padding: 12px;
+      background: var(--input-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 16px;
+      letter-spacing: 4px;
+      text-align: center;
+    }
+
+    .lock-input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.1);
+    }
+
+    .lock-input:disabled {
+      opacity: 0.6;
+    }
+
+    .lock-btn {
+      width: 100%;
+      padding: 12px;
+      font-size: 14px;
+    }
+
+    .lock-error {
+      font-size: 12px;
+      color: var(--danger);
+      text-align: center;
+      min-height: 16px;
+      margin-top: -10px;
+    }
+
+    @keyframes shake {
+      0%, 100% { transform: translateX(0); }
+      20% { transform: translateX(-8px); }
+      40% { transform: translateX(8px); }
+      60% { transform: translateX(-5px); }
+      80% { transform: translateX(5px); }
+    }
+
+    .lock-card.shake {
+      animation: shake 0.35s ease;
+    }
+
+    .lock-hint {
+      font-size: 11px;
+      color: var(--text-secondary);
+      text-align: center;
+      margin-top: -12px;
+      line-height: 1.5;
+    }
+
+    .logout-btn {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-left: 8px;
+      padding: 6px 10px;
+      cursor: pointer;
+      color: var(--text-secondary);
+      font-size: 12px;
+      transition: all 0.15s ease;
+    }
+
+    .logout-btn:hover {
+      color: var(--text);
+      border-color: var(--accent);
+    }
+
     /* 响应式 */
     @media (max-width: 480px) {
       body {
@@ -830,6 +951,7 @@
       <span class="theme-dot"></span>
       <span id="themeLabel">浅色</span>
     </button>
+    <button class="logout-btn" id="logoutBtn" title="清除本设备的登录状态">退出</button>
   </div>
 
   <!-- 内容区域 -->
@@ -869,6 +991,18 @@
     </div>
   </div>
 
+  <!-- 密码锁屏 -->
+  <div class="lock-screen" id="lockScreen">
+    <div class="lock-card" id="lockCard">
+      <div class="lock-title">FISHBLUE</div>
+      <div class="lock-subtitle">请输入访问密码</div>
+      <input id="lockInput" class="lock-input" type="password" autocomplete="current-password" placeholder="密码" />
+      <div class="lock-error" id="lockError"></div>
+      <button id="lockBtn" class="btn btn-primary lock-btn">进入</button>
+      <div class="lock-hint">验证成功后，本设备长期无需再次输入密码</div>
+    </div>
+  </div>
+
   <!-- 弹窗 -->
   <div class="modal" id="modal">
     <div class="modal-content">
@@ -886,6 +1020,14 @@
   <script>
     const API_BASE = "https://copy-api.fishblue.cn";
     const LOCAL_STORAGE_KEY = 'activeTab';
+
+    // 登录凭据存放位置：localStorage —— 关掉浏览器/重启手机也依然记得本设备。
+    // （换成 sessionStorage 则关闭标签页就失效，这是"长期免输"与否的关键差别）
+    const AUTH_KEY = 'auth';
+    // 剩余不足 1 分钟就视作已过期，避免请求刚好卡在过期瞬间
+    const AUTH_EXPIRY_MARGIN_MS = 60 * 1000;
+    const LOGIN_TIMEOUT_MS = 15000;
+    const REQUEST_TIMEOUT_MS = 15000;
 
     // DOM元素
     const themeBtn = document.getElementById('themeBtn');
@@ -912,10 +1054,123 @@
     const modalConfirmBtn = document.getElementById('modalConfirm');
     const toastEl = document.getElementById('toast');
 
+    // 锁屏元素
+    const lockScreenEl = document.getElementById('lockScreen');
+    const lockCardEl = document.getElementById('lockCard');
+    const lockInputEl = document.getElementById('lockInput');
+    const lockErrorEl = document.getElementById('lockError');
+    const lockBtnEl = document.getElementById('lockBtn');
+    const logoutBtnEl = document.getElementById('logoutBtn');
+
     // 状态
     let itemsCache = [];
     let todosCache = [];
     let pendingDeleteId = null;
+    let appUnlocked = false;
+    let lockSubmitting = false;
+    let lockCooldownTimer = null;
+
+    // ====================== 登录凭据（与后端 /auth/login 配套） ======================
+    // localStorage 不可用时（隐私模式等）降级到 sessionStorage，再不行就用内存兜底
+    const authStore = (() => {
+      try {
+        localStorage.setItem('__probe__', '1');
+        localStorage.removeItem('__probe__');
+        return localStorage;
+      } catch {
+        try {
+          return sessionStorage;
+        } catch {
+          return null;
+        }
+      }
+    })();
+    let memoryAuth = null;
+
+    function saveAuth(data) {
+      const rawExp = Number(data && data.expiresAt);
+      const rawTtl = Number(data && data.ttlMs);
+      let expiresAt = Number.isFinite(rawExp) ? rawExp : NaN;
+      if (!Number.isFinite(expiresAt) && Number.isFinite(rawTtl)) expiresAt = Date.now() + rawTtl;
+      if (!Number.isFinite(expiresAt)) expiresAt = Date.now() + 12 * 3600 * 1000;
+
+      const record = { token: String(data.token), expiresAt };
+      memoryAuth = record;
+      try {
+        if (authStore) authStore.setItem(AUTH_KEY, JSON.stringify(record));
+      } catch {}
+    }
+
+    function getAuth() {
+      let record = memoryAuth;
+      if (authStore) {
+        try {
+          const raw = authStore.getItem(AUTH_KEY);
+          if (raw) record = JSON.parse(raw);
+        } catch {
+          record = null;
+        }
+      }
+      if (!record || typeof record.token !== 'string' || !record.token) return null;
+      if (!Number.isFinite(record.expiresAt) || record.expiresAt <= Date.now() + AUTH_EXPIRY_MARGIN_MS) {
+        memoryAuth = null;
+        try {
+          if (authStore) authStore.removeItem(AUTH_KEY);
+        } catch {}
+        return null;
+      }
+      return record;
+    }
+
+    function clearAuth() {
+      memoryAuth = null;
+      try {
+        if (authStore) authStore.removeItem(AUTH_KEY);
+      } catch {}
+    }
+
+    // 兼容旧浏览器（AbortSignal.timeout 在 Safari 16 以下没有）
+    function timeoutSignal(ms) {
+      if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+        return AbortSignal.timeout(ms);
+      }
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), ms);
+      return controller.signal;
+    }
+
+    // 统一请求出口：自动带上 Bearer token，并补上超时保护
+    async function apiFetch(path, options = {}) {
+      const headers = { ...(options.headers || {}) };
+      const auth = getAuth();
+      if (auth) headers['Authorization'] = 'Bearer ' + auth.token;
+
+      let response;
+      try {
+        response = await fetch(API_BASE + path, {
+          ...options,
+          headers,
+          signal: options.signal || timeoutSignal(REQUEST_TIMEOUT_MS)
+        });
+      } catch (error) {
+        if (error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+          const timeoutError = new Error('请求超时，请检查网络后重试');
+          timeoutError.code = 'TIMEOUT';
+          throw timeoutError;
+        }
+        throw error;
+      }
+
+      if (response.status === 401) {
+        clearAuth();
+        lockPage('登录已过期，请重新输入密码');
+        const authError = new Error('登录已过期，请重新输入密码');
+        authError.code = 'AUTH_REQUIRED';
+        throw authError;
+      }
+
+      return response;
+    }
 
     // 初始化主题
     function initTheme() {
@@ -1055,9 +1310,10 @@
     }
 
     async function fetchTexts() {
+      if (!appUnlocked) return;
       setCopyStatus('加载中...');
       try {
-        const response = await fetch(API_BASE + '/texts');
+        const response = await apiFetch('/texts');
         const data = await response.json();
         if (!data.success) throw new Error(data.error || '加载失败');
 
@@ -1132,7 +1388,7 @@
       showToast('删除成功');
 
       try {
-        const response = await fetch(`${API_BASE}/texts/${id}`, {
+        const response = await apiFetch(`/texts/${id}`, {
           method: 'DELETE'
         });
         const data = await response.json();
@@ -1173,7 +1429,7 @@
       }, 10);
 
       try {
-        const response = await fetch(API_BASE + '/submit', {
+        const response = await apiFetch('/submit', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content })
@@ -1239,8 +1495,9 @@
 
     // ====================== TODO功能 ======================
     async function fetchTodos() {
+      if (!appUnlocked) return;
       try {
-        const response = await fetch(API_BASE + '/todoList');
+        const response = await apiFetch('/todoList');
         const data = await response.json();
         if (!data.success) throw new Error(data.error || '加载失败');
 
@@ -1308,7 +1565,7 @@
       }, 10);
 
       try {
-        const response = await fetch(API_BASE + '/todo-submit', {
+        const response = await apiFetch('/todo-submit', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ todoData })
@@ -1354,7 +1611,7 @@
       }
 
       try {
-        const response = await fetch(API_BASE + '/del-todo', {
+        const response = await apiFetch('/del-todo', {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ id })
@@ -1407,43 +1664,128 @@
       }
     });
 
-    // 初始化
-    initTheme();
+    // ====================== 密码锁屏 ======================
+    // 密码不在前端保存，改为向后端 /auth/login 换取 token；token 存 localStorage，故本设备长期免输
+    function isUnlocked() {
+      return !!getAuth();
+    }
 
-    // API测试函数
-    async function testAPIConnection() {
-      console.log('测试API连接...');
-      try {
-        console.log('API基础URL:', API_BASE);
-
-        // 测试texts接口
-        const textsRes = await fetch(API_BASE + '/texts');
-        const textsData = await textsRes.json();
-        console.log('texts接口状态:', textsRes.status, textsData.success ? '✅ 正常' : '❌ 异常');
-
-        // 测试todoList接口
-        try {
-          const todoRes = await fetch(API_BASE + '/todoList');
-          const todoData = await todoRes.json();
-          console.log('todoList接口状态:', todoRes.status, todoData.success ? '✅ 正常' : '❌ 异常');
-        } catch (todoError) {
-          console.warn('todoList接口错误:', todoError.message);
-        }
-      } catch (error) {
-        console.error('API连接测试失败:', error);
+    // 解锁后才加载当前 tab 的数据
+    function loadActiveTabData() {
+      if (getActiveTab() === 'copy') {
+        fetchTexts();
+      } else {
+        fetchTodos();
       }
     }
 
-    // 根据当前tab加载数据
-    const activeTab = getActiveTab();
-    if (activeTab === 'copy') {
-      fetchTexts();
-    } else {
-      fetchTodos();
+    function unlockPage() {
+      appUnlocked = true;
+      lockScreenEl.classList.add('hidden');
+      lockErrorEl.textContent = '';
+      loadActiveTabData();
     }
 
-    // 可选：运行API测试
-    // testAPIConnection();
+    function lockPage(message) {
+      appUnlocked = false;
+      lockScreenEl.classList.remove('hidden');
+      lockErrorEl.textContent = message || '';
+      lockInputEl.value = '';
+      setTimeout(() => lockInputEl.focus(), 100);
+    }
+
+    function showLockError(message) {
+      lockErrorEl.textContent = message;
+      lockInputEl.value = '';
+      lockCardEl.classList.remove('shake');
+      void lockCardEl.offsetWidth; // 强制重排以重启动画
+      lockCardEl.classList.add('shake');
+
+      // 短暂禁用，压制连续尝试（真正的限流在后端 Redis 计数里）
+      lockInputEl.disabled = true;
+      lockBtnEl.disabled = true;
+      clearTimeout(lockCooldownTimer);
+      lockCooldownTimer = setTimeout(() => {
+        lockInputEl.disabled = false;
+        lockBtnEl.disabled = false;
+        lockInputEl.focus();
+      }, 800);
+    }
+
+    async function handleUnlockAttempt() {
+      if (appUnlocked || lockSubmitting) return;
+
+      const password = lockInputEl.value;
+      if (!password) {
+        showLockError('请输入密码');
+        return;
+      }
+
+      lockSubmitting = true;
+      lockBtnEl.disabled = true;
+      lockErrorEl.textContent = '';
+
+      try {
+        const response = await fetch(API_BASE + '/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          // remember: true —— 请后端签发长期凭据，本设备不再反复询问
+          body: JSON.stringify({ password, remember: true }),
+          signal: timeoutSignal(LOGIN_TIMEOUT_MS)
+        });
+
+        const payload = await response.json().catch(() => null);
+        const body = payload && typeof payload === 'object' ? payload : null;
+
+        if (response.ok && body && body.success && body.data && body.data.token) {
+          saveAuth(body.data);
+          lockInputEl.value = '';
+          lockErrorEl.textContent = '';
+          unlockPage();
+          return;
+        }
+
+        if (response.status === 401) {
+          showLockError('密码错误，请重试');
+        } else if (response.status === 429) {
+          showLockError((body && body.error) || '尝试过于频繁，请稍后再试');
+        } else if (response.status === 503) {
+          showLockError((body && body.error) || '服务端鉴权尚未配置完成');
+        } else {
+          showLockError((body && body.error) || ('登录失败（' + response.status + '）'));
+        }
+      } catch (error) {
+        // 网络异常与密码错误必须区分提示，否则用户会误以为密码错了
+        showLockError('网络异常，请检查网络后重试');
+      } finally {
+        lockSubmitting = false;
+        // 只有不处于"抖动冷却期"时才恢复按钮，避免覆盖提示动效
+        if (!lockInputEl.disabled) lockBtnEl.disabled = false;
+      }
+    }
+
+    lockBtnEl.addEventListener('click', handleUnlockAttempt);
+    lockInputEl.addEventListener('keydown', e => {
+      if (e.key === 'Enter') handleUnlockAttempt();
+    });
+
+    // 退出登录：清除本设备凭据，下次需重新输密码
+    logoutBtnEl.addEventListener('click', () => {
+      clearAuth();
+      lockInputEl.value = '';
+      lockPage('');
+      showToast('已退出登录');
+    });
+
+    // 初始化
+    initTheme();
+
+    // 启动：本设备已有有效凭据就直接进页面，否则显示锁屏（解锁前不会发出任何数据请求）
+    if (isUnlocked()) {
+      unlockPage();
+    } else {
+      lockPage();
+    }
   </script>
 </body>
 </html>
